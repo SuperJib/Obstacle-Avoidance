@@ -1,171 +1,182 @@
+from controller import Robot
+import cv2
 import numpy as np
 import skfuzzy as fuzz
-import csv
 from skfuzzy import control as ctrl
-from controller import Robot, Camera
-import cv2
+import csv
 
-class CustomCamera:
-    def __init__(self, camera):
-        self.camera = camera
-        self.width = int(self.camera.getWidth())
-        self.height = int(self.camera.getHeight())
-        self.image_data = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+# create the Robot instance.
+robot = Robot()
 
-    def getImage(self):
-        res = self.camera.getImageArray()
-        if res is not None:
-            self.image_data = np.array(res, dtype=np.uint8)
-        return self.image_data
+def run_robot(robot):
+    timestep = int(robot.getBasicTimeStep())
+    
+    camera = robot.getDevice("camera")
+    camera.enable(timestep)
+    
+    ds = []
+    dsNames = ['left infrared sensor','front left infrared sensor', 'front infrared sensor',
+                'front right infrared sensor', 'right infrared sensor']
+    for i in range(5):
+        ds.append(robot.getDevice(dsNames[i]))
+        ds[i].enable(timestep)
+
+    wheels = []
+    wheels_names = ['left wheel motor', 'right wheel motor']
+    for i in range(2):
+        wheels.append(robot.getDevice(wheels_names[i]))
+        wheels[i].setPosition(float('inf'))
+        wheels[i].setVelocity(0.0)
+    
+    # Define fuzzy variables
+    error = ctrl.Antecedent(np.arange(-376, 377, 1), 'error')
+    delta_error = ctrl.Antecedent(np.arange(-376, 376, 1), 'delta_error')
+    left_speed = ctrl.Consequent(np.arange(-6.28, 6.28, 1), 'left_speed')
+    right_speed = ctrl.Consequent(np.arange(-6.28, 6.28, 1), 'right_speed')  
+    
+    # Define fuzzy sets for error
+    error['negative'] = fuzz.trapmf(error.universe, [-376, -376, -120, 0])
+    error['zero'] = fuzz.trimf(error.universe, [-50, 0, 50])
+    error['positive'] = fuzz.trapmf(error.universe, [0, 120, 376, 376])
+
+    delta_error['negative'] = fuzz.trapmf(delta_error.universe, [-376, -376, -120, 0])
+    delta_error['zero'] = fuzz.trimf(delta_error.universe, [-70, 0, 70])
+    delta_error['positive'] = fuzz.trapmf(delta_error.universe, [0, 120, 376, 376])
+
+    # Define fuzzy sets for speeds
+    left_speed['n_med'] = fuzz.trimf(left_speed.universe, [-6.28, -6.28, -3.14])
+    left_speed['n_slow'] = fuzz.trimf(left_speed.universe, [-3.14, 0, 0])
+    left_speed['slow'] = fuzz.trimf(left_speed.universe, [0, 0, 3.14])
+    left_speed['medium'] = fuzz.trimf(left_speed.universe, [0, 3.14, 3.14])
+    left_speed['fast'] = fuzz.trimf(left_speed.universe, [3.14, 6.28, 6.28])
+
+    right_speed['n_med'] = fuzz.trimf(right_speed.universe, [-6.28, -6.28, -3.14])
+    right_speed['n_slow'] = fuzz.trimf(right_speed.universe, [-3.14, 0, 0])
+    right_speed['slow'] = fuzz.trimf(right_speed.universe, [0, 0, 3.14])
+    right_speed['medium'] = fuzz.trimf(right_speed.universe, [0, 3.14, 3.14])
+    right_speed['fast'] = fuzz.trimf(right_speed.universe, [3.14, 6.28, 6.28])
+
+    # Define fuzzy rules
+    rule1 = ctrl.Rule(error['negative'] & delta_error['negative'], (left_speed['fast'], right_speed['n_med']))
+    rule2 = ctrl.Rule(error['negative'] & delta_error['zero'], (left_speed['fast'], right_speed['n_slow']))
+    rule3 = ctrl.Rule(error['negative'] & delta_error['positive'], (left_speed['fast'], right_speed['slow']))
+    rule4 = ctrl.Rule(error['zero'] & delta_error['negative'], (left_speed['fast'], right_speed['medium']))
+    rule5 = ctrl.Rule(error['zero'] & delta_error['zero'], (left_speed['fast'], right_speed['fast']))
+    rule6 = ctrl.Rule(error['zero'] & delta_error['positive'], (left_speed['medium'], right_speed['fast']))
+    rule7 = ctrl.Rule(error['positive'] & delta_error['negative'], (left_speed['slow'], right_speed['fast']))
+    rule8 = ctrl.Rule(error['positive'] & delta_error['zero'], (left_speed['n_slow'], right_speed['fast']))
+    rule9 = ctrl.Rule(error['positive'] & delta_error['positive'], (left_speed['n_med'], right_speed['fast']))
+
+    # Create control system and simulation
+    speed_ctrl = ctrl.ControlSystem([rule1, rule2, rule3, rule4, rule5, rule6, rule7, rule8, rule9])
+    speed = ctrl.ControlSystemSimulation(speed_ctrl)
+
+    e_prev = 0  # Initialize previous error
+    
+    with open('hasil_simulasi.csv', mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Time', 'Objek', 'Error', 'Delta Error', 'Motor Kiri', 'Motor Kanan']) # Header sesuai data sensor
         
-    def displayImage(self):
-        cv2.imshow('Camera Image', self.image_data)
-        cv2.waitKey(1)
+        while robot.step(timestep) != -1:
+            # Get image from the camera
+            img = camera.getImage()
+            if img:
+                # Convert the image to a format that OpenCV can use
+                img = np.frombuffer(img, np.uint8).reshape((camera.getHeight(), camera.getWidth(), 4))
+                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                
+                # Convert BGR image to HSV
+                hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+                
+                # Define range of blue color in HSV
+                lower_blue = np.array([110, 50, 50])
+                upper_blue = np.array([130, 255, 255])
+                
+                # Create masks for blue color
+                mask = cv2.inRange(hsv, lower_blue, upper_blue)
+                
+                # Find contours
+                contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+                
+                # Draw contours and find the largest one
+                largest_contour = None
+                max_area = 0
+                for contour in contours:
+                    area = cv2.contourArea(contour)
+                    if area > max_area:
+                        max_area = area
+                        largest_contour = contour
+                
+                if largest_contour is not None:
+                    # Compute the center of the largest contour
+                    M = cv2.moments(largest_contour)
+                    if M["m00"] != 0:
+                        object_x = int(M["m10"] / M["m00"])
+                        object_y = int(M["m01"] / M["m00"])
+                        cv2.circle(img, (object_x, object_y), 5, (0, 255, 0), -1)
+                        print(object_y)
+                        print(object_x)
+                        # Get the image width
+                        height, width, _ = img.shape
+                        img_center_x = width // 2
+                        
+                        # Draw the vertical center line
+                        cv2.line(img, (img_center_x, 0), (img_center_x, height), (0, 255, 0), 1)
+                        
+                        # Calculate the error between the center of the object and the center of the image
+                        error_value = img_center_x - object_x
+                        d_error = error_value - e_prev
+                        e_prev = error_value
 
-class FuzzyController:
-    def __init__(self):
-        self.robot = Robot()
+                        # Set the fuzzy input
+                        speed.input['error'] = error_value
+                        speed.input['delta_error'] = d_error
 
-        # Initialize data storage
-        self.data = []
+                        # Compute the fuzzy output
+                        speed.compute()
+                        
+                        # Get the fuzzy output for wheel speeds
+                        l_speed = speed.output['left_speed']
+                        r_speed = speed.output['right_speed']
 
-        # Definisi waktu langkah dasar
-        self.TIME_STEP = int(self.robot.getBasicTimeStep())
-        # Set kecepatan motor
-        self.Max = 3.14
+                        current_time = robot.getTime()
 
-        # Get devices
-        self.ps = []
-        self.ps_names = ['ps0', 'ps1', 'ps2', 'ps3', 'ps4', 'ps5', 'ps6', 'ps7']
-        for name in self.ps_names:
-            sensor = self.robot.getDevice(name)
-            sensor.enable(self.TIME_STEP)
-            self.ps.append(sensor)
+                        writer.writerow([current_time, object_x, error_value, d_error, l_speed, r_speed])
 
-        # Inisialisasi motor
-        self.left_motor = self.robot.getDevice('left wheel motor')
-        self.right_motor = self.robot.getDevice('right wheel motor')
-
-        self.left_motor.setPosition(float('inf'))
-        self.right_motor.setPosition(float('inf'))
-
-        self.left_motor.setVelocity(0.0)
-        self.right_motor.setVelocity(0.0)
-
-        # Inisialisasi kamera
-        camera_device = self.robot.getDevice('camera')
-        camera_device.enable(self.TIME_STEP)
-        self.camera = CustomCamera(camera_device)
-
-        # Variabel input
-        self.left_distance = ctrl.Antecedent(np.arange(0, 101, 1), 'left_distance')
-        self.right_distance = ctrl.Antecedent(np.arange(0, 101, 1), 'right_distance')
-
-        # Variabel output
-        self.left_speed = ctrl.Consequent(np.arange(-1, 1.01, 0.01), 'left_speed')
-        self.right_speed = ctrl.Consequent(np.arange(-1, 1.01, 0.01), 'right_speed')
-
-        # Fuzzy membership functions untuk input front_distance, left_distance
-        self.left_distance['dekatL'] = fuzz.trapmf(self.left_distance.universe, [0, 0, 25, 50])
-        self.left_distance['sedenganL'] = fuzz.trapmf(self.left_distance.universe, [25, 35, 65, 75])
-        self.left_distance['jauhL'] = fuzz.trapmf(self.left_distance.universe, [50, 75, 100, 100])
-
-        self.right_distance['dekatR'] = fuzz.trapmf(self.right_distance.universe, [0, 0, 25, 50])
-        self.right_distance['sedenganR'] = fuzz.trapmf(self.right_distance.universe, [25, 35, 65, 75])
-        self.right_distance['jauhR'] = fuzz.trapmf(self.right_distance.universe, [50, 75, 100, 100])
-
-        # Fuzzy membership functions untuk output left_speed dan right_speed
-        self.left_speed['lambatL'] = fuzz.trapmf(self.left_speed.universe, [-1, -1, -0.5, 0])
-        self.left_speed['sedangL'] = fuzz.trapmf(self.left_speed.universe, [-0.5, 0, 0, 0.5])
-        self.left_speed['cepatL'] = fuzz.trapmf(self.left_speed.universe, [0, 0.5, 1, 1])
-
-        self.right_speed['lambatR'] = fuzz.trapmf(self.right_speed.universe, [-1, -1, -0.5, 0])
-        self.right_speed['sedangR'] = fuzz.trapmf(self.right_speed.universe, [-0.5, 0, 0, 0.5])
-        self.right_speed['cepatR'] = fuzz.trapmf(self.right_speed.universe, [0, 0.5, 1, 1])
-
-        # Aturan fuzzy
-        self.rule1 = ctrl.Rule(self.left_distance['dekatL'] & self.right_distance['dekatR'], [self.left_speed['lambatL'], self.right_speed['lambatR']])
-        self.rule2 = ctrl.Rule(self.left_distance['sedenganL'] & self.right_distance['dekatR'], [self.left_speed['sedangL'], self.right_speed['lambatR']])
-        self.rule3 = ctrl.Rule(self.left_distance['jauhL'] & self.right_distance['dekatR'], [self.left_speed['cepatL'], self.right_speed['lambatR']])
-        self.rule4 = ctrl.Rule(self.left_distance['dekatL'] & self.right_distance['sedenganR'], [self.left_speed['lambatL'], self.right_speed['lambatR']])
-        self.rule5 = ctrl.Rule(self.left_distance['dekatL'] & self.right_distance['jauhR'], [self.left_speed['lambatL'], self.right_speed['cepatR']])
-        self.rule6 = ctrl.Rule(self.left_distance['sedenganL'] & self.right_distance['sedenganR'], [self.left_speed['sedangL'], self.right_speed['sedangR']])
-        self.rule7 = ctrl.Rule(self.left_distance['sedenganL'] & self.right_distance['jauhR'], [self.left_speed['lambatL'], self.right_speed['cepatR']])
-        self.rule8 = ctrl.Rule(self.left_distance['jauhL'] & self.right_distance['sedenganR'], [self.left_speed['cepatL'], self.right_speed['lambatR']])
-        self.rule9 = ctrl.Rule(self.left_distance['jauhL'] & self.right_distance['jauhR'], [self.left_speed['cepatL'], self.right_speed['cepatR']])
-
-        # Kompilasi aturan menjadi kontroler fuzzy
-        self.speed_ctrl = ctrl.ControlSystem([self.rule1, self.rule2, self.rule3, self.rule4, self.rule5, self.rule6, self.rule7, self.rule8, self.rule9])
-        self.speeding = ctrl.ControlSystemSimulation(self.speed_ctrl)
-
-    def run(self):
-        while self.robot.step(self.TIME_STEP) != -1:
-            # Get camera image data
-            camera_image = self.camera.getImage()
-
-            # Display the camera image
-            self.camera.displayImage()
-
-            # Define the red color range (BGR format)
-            lower_red = np.array([225, 21, 21])  # Lower bound of red color range
-            upper_red = np.array([225, 0, 0])  # Upper bound of red color range
-
-            # Create a mask to extract red pixels
-            mask = cv2.inRange(camera_image, lower_red, upper_red)
-
-            # Count the number of red pixels
-            red_pixels = cv2.countNonZero(mask)
-
-            # Print or process the number of red pixels here
-            print("Number of red pixels:", red_pixels)
-
-            # Get sensor data
-            ps_values = [sensor.getValue() for sensor in self.ps]
-
-            left_distance_input = min(ps_values[4], ps_values[5], ps_values[6], ps_values[7])
-            right_distance_input = min(ps_values[0], ps_values[1], ps_values[2], ps_values[3])
-
-            if 0 <= left_distance_input <= 100 and 0 <= right_distance_input <= 100:
-                self.speeding.input['left_distance'] = left_distance_input
-                self.speeding.input['right_distance'] = right_distance_input
-
-                self.speeding.compute()
-
-                left_speed_val = self.speeding.output['left_speed']
-                right_speed_val = self.speeding.output['right_speed']
+                        if ds[2].getValue() >= 250:
+                            l_speed = 0
+                            r_speed = 0
+                else:
+                    # If no object is detected, use obstacle avoidance logic
+                    if ds[0].getValue() >= 200:
+                        l_speed = 4
+                        r_speed = -4
+                    elif ds[1].getValue() >= 200:
+                        l_speed = 4
+                        r_speed = -4
+                    elif ds[3].getValue() >= 200:
+                        l_speed = -4
+                        r_speed = 4
+                    elif ds[4].getValue() >= 200:
+                        l_speed = -4
+                        r_speed = 4
+                    else:
+                        l_speed = 8
+                        r_speed = 8
+                
+                img_resized = cv2.resize(img, (0, 0), fx=0.5, fy=0.5) # Resize the image to half its original size
+                
+                # Display the image with the center line and detected object
+                cv2.imshow("Camera View", img_resized)
+                cv2.waitKey(1)
             else:
-                left_speed_val = 1
-                right_speed_val = 1
-
-            if max(ps_values[0], ps_values[1], ps_values[2], ps_values[3]) > 100:
-                left_speed_val = -1
-                right_speed_val = 1
-            elif max(ps_values[4], ps_values[5], ps_values[6], ps_values[7]) > 100:
-                left_speed_val = 1
-                right_speed_val = -1
-            else:
-                left_speed_val = 1
-                right_speed_val = 1
-
-            self.left_motor.setVelocity(left_speed_val * self.Max)
-            self.right_motor.setVelocity(right_speed_val * self.Max)
-
-            # Record data
-            self.data.append([left_distance_input, right_distance_input, left_speed_val * self.Max, right_speed_val * self.Max])
-
-            print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
-            print("Nilai Sensor Jarak:", [round(val, 2) for val in ps_values])
-            print("Kecepatan Motor Kiri:", left_speed_val * self.Max)
-            print("Kecepatan Motor Kanan:", right_speed_val * self.Max)
-            print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
-
-    def save_data(self, filename='robot_performance_data.csv'):
-        with open(filename, 'w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(["Left Distance", "Right Distance", "Left Speed", "Right Speed"])
-            writer.writerows(self.data)
+                # Default wheel speeds if no image is received
+                l_speed = 0
+                r_speed = 0
+            
+            # Set the wheel speeds
+            wheels[0].setVelocity(l_speed)
+            wheels[1].setVelocity(r_speed)
 
 if __name__ == "__main__":
-    controller = FuzzyController()
-    controller.run()
-    controller.save_data()
+    run_robot(robot)
